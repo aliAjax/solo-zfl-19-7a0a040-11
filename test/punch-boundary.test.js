@@ -272,6 +272,44 @@ test("回报:边界类型被拒绝且不改状态", async () => {
   assert.equal(now.body.data.nextSeq, 1);
 });
 
+test("入参:conflictPairs 为 null 按非数组拒绝,缺省字段正常创建", async () => {
+  const before = await jobCount();
+  const nullRes = await api("POST", "/punch-jobs", {
+    tuneId: "tune_demo",
+    pins: [1, 2],
+    maxPunchesPerStroke: 2,
+    holes: [{ lane: 1, position: 1 }],
+    conflictPairs: null
+  });
+  assert.equal(nullRes.status, 400, JSON.stringify(nullRes.body));
+  assert.match(nullRes.body.error, /conflictPairs/);
+  assert.equal(await jobCount(), before, "null 冲突轨约束不得创建任务、不得写入数据");
+
+  // 缺少 conflictPairs 字段仍正常创建
+  const missing = await api("POST", "/punch-jobs", {
+    tuneId: "tune_demo",
+    pins: [1, 2],
+    maxPunchesPerStroke: 2,
+    holes: [
+      { lane: 1, position: 1 },
+      { lane: 2, position: 1 }
+    ]
+  });
+  assert.equal(missing.status, 201, "缺少 conflictPairs 字段应正常创建");
+  assert.deepEqual(missing.body.data.conflictPairs, []);
+  assert.equal(missing.body.data.steps.length, 1, "无冲突约束时同行程可合并");
+});
+
+test("入参:请求体整体为 null 或非对象时返回参数错误且不创建任务", async () => {
+  const before = await jobCount();
+  for (const bad of [null, [1, 2], "text", 5, true]) {
+    const res = await api("POST", "/punch-jobs", bad);
+    assert.equal(res.status, 400, `body=${JSON.stringify(bad)}: ${JSON.stringify(res.body)}`);
+    assert.ok(res.body.error, "应返回明确的参数错误信息");
+  }
+  assert.equal(await jobCount(), before, "非法请求体不得创建任务、不得写入数据");
+});
+
 test("并行:并发重复失败回报只计一次失败", async () => {
   const job = await createJob();
   const results = await Promise.all(Array.from({ length: 5 }, () => report(job.id, { seq: 1, result: "failed" })));

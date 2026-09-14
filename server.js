@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, rename, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
@@ -83,7 +83,7 @@ async function ensureDb() {
   try {
     JSON.parse(await readFile(DB_FILE, "utf8"));
   } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
+    await writeDb(initialData);
   }
 }
 
@@ -94,8 +94,12 @@ async function readDb() {
   return data;
 }
 
+// 先写临时文件再原子重命名:并发读永远不会遇到写了一半的文件
+let writeCounter = 0;
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  const tmp = `${DB_FILE}.${process.pid}.${writeCounter++}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, DB_FILE);
 }
 
 function send(res, status, body) {
@@ -311,6 +315,9 @@ function normalizeReports(body) {
 
 async function handleCreatePunchJob(req, res) {
   const body = await parseBody(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw httpError(400, "请求体必须是包含 tuneId、holes、pins、maxPunchesPerStroke 的JSON对象");
+  }
   required(body, ["tuneId", "holes", "pins", "maxPunchesPerStroke"]);
   return withPunchLock(async () => {
     const db = await readDb();
@@ -342,7 +349,7 @@ async function handleCreatePunchJob(req, res) {
     }
     holes.sort((a, b) => a.position - b.position || a.lane - b.lane);
 
-    if (body.conflictPairs !== undefined && body.conflictPairs !== null && !Array.isArray(body.conflictPairs)) {
+    if (body.conflictPairs !== undefined && !Array.isArray(body.conflictPairs)) {
       throw httpError(400, "conflictPairs 必须是轨号对数组");
     }
     const conflictPairs = (body.conflictPairs ?? []).map((pair) => {

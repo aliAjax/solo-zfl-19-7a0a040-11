@@ -50,7 +50,8 @@ PORT=3019 node server.js
 
 ### 参数校验
 
-- `conflictPairs` 必须是轨号对数组(可缺省),否则返回 `400` 且不创建任务
+- 请求体必须是 JSON 对象;整体为 `null`、数组或标量时返回 `400`
+- `conflictPairs` 可缺省;传入 `null` 或非数组值返回 `400` 且不创建任务
 - `lane`/`position`/`seq`/`maxPunchesPerStroke` 必须是 JSON 数值类型:空值、布尔、字符串一律 `400`,不做强转
 - 非法入参在写入前拒绝,原有数据保持不变
 
