@@ -181,9 +181,17 @@ function httpError(status, message) {
 }
 
 function toLane(value, field) {
-  const lane = Number(value);
-  if (!Number.isInteger(lane) || lane < 1) throw httpError(400, `${field}必须是正整数轨号`);
-  return lane;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw httpError(400, `${field}必须是正整数轨号`);
+  }
+  return value;
+}
+
+function toPosition(value, field) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw httpError(400, `${field}必须是非负整数行程`);
+  }
+  return value;
 }
 
 function findPunchJob(db, jobId) {
@@ -273,12 +281,17 @@ function punchProgress(job) {
 }
 
 function normalizeReports(body) {
+  if (body && body.reports !== undefined && !Array.isArray(body.reports)) {
+    throw httpError(400, "reports 必须是数组");
+  }
   const list = Array.isArray(body && body.reports) ? body.reports : [body];
   if (!list.length) throw httpError(400, "回报内容不能为空");
   return list.map((item, index) => {
-    if (!item || typeof item !== "object") throw httpError(400, `第 ${index + 1} 条回报格式错误`);
-    const seq = Number(item.seq);
-    if (!Number.isInteger(seq) || seq < 1) throw httpError(400, `第 ${index + 1} 条回报的 seq 必须是正整数`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw httpError(400, `第 ${index + 1} 条回报格式错误`);
+    if (typeof item.seq !== "number" || !Number.isInteger(item.seq) || item.seq < 1) {
+      throw httpError(400, `第 ${index + 1} 条回报的 seq 必须是正整数`);
+    }
+    const seq = item.seq;
     const rawResult = String(item.result === undefined ? "ok" : item.result).toLowerCase();
     let result;
     if (PUNCH_RESULT_OK.has(rawResult)) result = "ok";
@@ -286,9 +299,7 @@ function normalizeReports(body) {
     else throw httpError(400, `第 ${index + 1} 条回报的 result 只能是 ok 或 failed`);
     const report = { seq, result };
     if (item.position !== undefined) {
-      const position = Number(item.position);
-      if (!Number.isInteger(position) || position < 0) throw httpError(400, `第 ${index + 1} 条回报的 position 非法`);
-      report.position = position;
+      report.position = toPosition(item.position, `第 ${index + 1} 条回报的行程`);
     }
     if (item.lanes !== undefined) {
       if (!Array.isArray(item.lanes) || !item.lanes.length) throw httpError(400, `第 ${index + 1} 条回报的 lanes 必须是非空数组`);
@@ -309,16 +320,20 @@ async function handleCreatePunchJob(req, res) {
     const pins = [...new Set(body.pins.map((pin) => toLane(pin, "冲针轨号")))].sort((a, b) => a - b);
     const pinSet = new Set(pins);
 
-    const maxPerStroke = Number(body.maxPunchesPerStroke);
-    if (!Number.isInteger(maxPerStroke) || maxPerStroke < 1) throw httpError(400, "maxPunchesPerStroke 必须是正整数");
+    const maxPerStroke = body.maxPunchesPerStroke;
+    if (typeof maxPerStroke !== "number" || !Number.isInteger(maxPerStroke) || maxPerStroke < 1) {
+      throw httpError(400, "maxPunchesPerStroke 必须是正整数");
+    }
 
     if (!Array.isArray(body.holes) || !body.holes.length) throw httpError(400, "holes 必须是非空孔位数组");
     const seen = new Set();
     const holes = [];
     for (const raw of body.holes) {
-      const lane = toLane(raw && raw.lane, "孔位轨号");
-      const position = Number(raw && raw.position);
-      if (!Number.isInteger(position) || position < 0) throw httpError(400, "孔位行程必须是非负整数");
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw httpError(400, "孔位必须是包含 lane 和 position 的对象");
+      }
+      const lane = toLane(raw.lane, "孔位轨号");
+      const position = toPosition(raw.position, "孔位行程");
       if (!pinSet.has(lane)) throw httpError(400, `轨 ${lane} 没有可用冲针`);
       const key = `${lane}:${position}`;
       if (seen.has(key)) continue; // 同一孔不能重复:去重
@@ -327,7 +342,10 @@ async function handleCreatePunchJob(req, res) {
     }
     holes.sort((a, b) => a.position - b.position || a.lane - b.lane);
 
-    const conflictPairs = (body.conflictPairs || []).map((pair) => {
+    if (body.conflictPairs !== undefined && body.conflictPairs !== null && !Array.isArray(body.conflictPairs)) {
+      throw httpError(400, "conflictPairs 必须是轨号对数组");
+    }
+    const conflictPairs = (body.conflictPairs ?? []).map((pair) => {
       if (!Array.isArray(pair) || pair.length !== 2) throw httpError(400, "conflictPairs 必须是轨号对数组");
       const a = toLane(pair[0], "冲突轨号");
       const b = toLane(pair[1], "冲突轨号");
@@ -359,6 +377,14 @@ async function handleCreatePunchJob(req, res) {
   });
 }
 
+// 重复回报判定:步骤已执行过(已完成;或已失败步骤再次回报相同失败结果)
+function isDuplicateReport(job, report) {
+  const step = job.steps[report.seq - 1];
+  if (!step) return false;
+  if (report.seq < job.nextSeq) return true;
+  return report.seq === job.nextSeq && step.status === "failed" && report.result === "failed";
+}
+
 async function handlePunchReport(req, res, jobId) {
   const body = await parseBody(req);
   const reports = normalizeReports(body);
@@ -367,22 +393,13 @@ async function handlePunchReport(req, res, jobId) {
     const job = findPunchJob(db, jobId);
     const totalSteps = job.steps.length;
 
-    // 重复回报:所报步骤全部已执行过 → 返回原进度,不改状态
-    if (reports.every((report) => report.seq < job.nextSeq)) {
-      return send(res, 200, { data: punchProgress(job), deduplicated: true, message: "重复回报,返回当前进度" });
-    }
-
-    if (job.status === "cancelled") throw httpError(409, "任务已取消,后续步骤已释放");
-    if (job.status === "completed") throw httpError(409, "任务已完成");
-
-    // 先整体校验:必须从 nextSeq 开始连续、与计划一致;任何错误都不改状态
-    let expected = job.nextSeq;
-    let failedSeen = false;
+    // 所报步骤必须存在
     for (const report of reports) {
       if (report.seq > totalSteps) throw httpError(409, `步骤 ${report.seq} 不存在,任务共 ${totalSteps} 步`);
-      if (failedSeen) throw httpError(409, "失败步骤之后的步骤不能在同一批次回报");
-      if (report.seq < expected) throw httpError(409, `步骤 ${report.seq} 已执行,属于乱序回报`);
-      if (report.seq > expected) throw httpError(409, `缺步:期望步骤 ${expected},收到 ${report.seq}`);
+    }
+
+    // 任何回报只要与计划不符(行程/轨位)都是冲突错误——包括已执行步骤的再次回报
+    for (const report of reports) {
       const step = job.steps[report.seq - 1];
       if (report.position !== undefined && report.position !== step.position) {
         throw httpError(409, `回报与计划冲突:步骤 ${report.seq} 的行程应为 ${step.position},收到 ${report.position}`);
@@ -390,6 +407,24 @@ async function handlePunchReport(req, res, jobId) {
       if (report.lanes !== undefined && JSON.stringify(report.lanes) !== JSON.stringify(step.lanes)) {
         throw httpError(409, `回报与计划冲突:步骤 ${report.seq} 的轨位应为 [${step.lanes.join(",")}]`);
       }
+    }
+
+    // 重复回报:全部指向已执行步骤 → 返回原进度,不改状态(失败次数不重复累计)
+    if (reports.every((report) => isDuplicateReport(job, report))) {
+      return send(res, 200, { data: punchProgress(job), deduplicated: true, message: "重复回报,返回当前进度" });
+    }
+
+    if (job.status === "cancelled") throw httpError(409, "任务已取消,后续步骤已释放");
+    if (job.status === "completed") throw httpError(409, "任务已完成");
+
+    // 连续性校验:必须从 nextSeq 开始连续;任何错误都不改状态
+    let expected = job.nextSeq;
+    let failedSeen = false;
+    for (const report of reports) {
+      if (isDuplicateReport(job, report)) throw httpError(409, `步骤 ${report.seq} 已执行,属于乱序回报`);
+      if (failedSeen) throw httpError(409, "失败步骤之后的步骤不能在同一批次回报");
+      if (report.seq < expected) throw httpError(409, `步骤 ${report.seq} 已执行,属于乱序回报`);
+      if (report.seq > expected) throw httpError(409, `缺步:期望步骤 ${expected},收到 ${report.seq}`);
       if (report.result === "failed") failedSeen = true;
       expected += 1;
     }
