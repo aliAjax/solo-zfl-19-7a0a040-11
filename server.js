@@ -3,7 +3,7 @@ const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
 
 const initialData = {
   tunes: [
@@ -53,7 +53,8 @@ const initialData = {
       createdAt: new Date().toISOString(),
       resolvedAt: null
     }
-  ]
+  ],
+  punchJobs: []
 };
 
 const routes = [
@@ -67,7 +68,14 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /punch-jobs",
+  "POST /punch-jobs",
+  "GET /punch-jobs/:id",
+  "GET /punch-jobs/:id/plan",
+  "GET /punch-jobs/:id/progress",
+  "POST /punch-jobs/:id/reports",
+  "POST /punch-jobs/:id/cancel"
 ];
 
 async function ensureDb() {
@@ -81,7 +89,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const data = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(data.punchJobs)) data.punchJobs = [];
+  return data;
 }
 
 async function writeDb(data) {
@@ -149,6 +159,284 @@ function buildProgress(db, tuneId) {
     resolvedIssues: issues.length - openIssues,
     percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
   };
+}
+
+// ---------- 打孔执行编排 ----------
+
+const PUNCH_RESULT_OK = new Set(["ok", "success", "completed", "done"]);
+const PUNCH_RESULT_FAILED = new Set(["failed", "failure", "error"]);
+
+// 所有打孔任务的写操作串行化:并行回报不会重复执行,也不会跳过步骤
+let punchQueue = Promise.resolve();
+function withPunchLock(fn) {
+  const run = punchQueue.then(() => fn());
+  punchQueue = run.catch(() => {});
+  return run;
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function toLane(value, field) {
+  const lane = Number(value);
+  if (!Number.isInteger(lane) || lane < 1) throw httpError(400, `${field}必须是正整数轨号`);
+  return lane;
+}
+
+function findPunchJob(db, jobId) {
+  const job = db.punchJobs.find((item) => item.id === jobId);
+  if (!job) throw httpError(404, "打孔任务不存在");
+  return job;
+}
+
+function buildConflictMap(conflictPairs) {
+  const map = new Map();
+  for (const [a, b] of conflictPairs) {
+    if (!map.has(a)) map.set(a, new Set());
+    if (!map.has(b)) map.set(b, new Set());
+    map.get(a).add(b);
+    map.get(b).add(a);
+  }
+  return map;
+}
+
+function lanesConflict(conflictMap, a, b) {
+  return conflictMap.has(a) && conflictMap.get(a).has(b);
+}
+
+// 在 g 个分组内按轨号升序首次适配回溯,结果确定:同一步数下轨号小的优先进入靠前的行程
+function assignLanes(lanes, index, groups, conflictMap, maxPerStroke) {
+  if (index === lanes.length) return groups.map((group) => [...group]);
+  const lane = lanes[index];
+  for (const group of groups) {
+    if (group.length >= maxPerStroke) continue;
+    if (group.some((other) => lanesConflict(conflictMap, lane, other))) continue;
+    group.push(lane);
+    const result = assignLanes(lanes, index + 1, groups, conflictMap, maxPerStroke);
+    if (result) return result;
+    group.pop();
+    if (group.length === 0) break; // 空组互相等价,剪枝
+  }
+  return null;
+}
+
+// 单个行程位置的最少分组:从下限递增尝试,第一个可行解即最少冲压步数
+function minStrokeGroups(lanes, conflictMap, maxPerStroke) {
+  const sorted = [...lanes].sort((a, b) => a - b);
+  if (!sorted.length) return [];
+  const lowerBound = Math.max(1, Math.ceil(sorted.length / maxPerStroke));
+  for (let g = lowerBound; g <= sorted.length; g++) {
+    const groups = Array.from({ length: g }, () => []);
+    const result = assignLanes(sorted, 0, groups, conflictMap, maxPerStroke);
+    if (result) return result.filter((group) => group.length > 0);
+  }
+  return sorted.map((lane) => [lane]); // 不可达:单孔一组必然可行
+}
+
+// 生成冲压计划:纸带单向前进(行程升序),同一行程内冲突轨不共存,每孔只出现一次
+function buildPunchPlan(holes, conflictPairs, maxPerStroke) {
+  const conflictMap = buildConflictMap(conflictPairs);
+  const byPosition = new Map();
+  for (const hole of holes) {
+    if (!byPosition.has(hole.position)) byPosition.set(hole.position, []);
+    byPosition.get(hole.position).push(hole.lane);
+  }
+  const positions = [...byPosition.keys()].sort((a, b) => a - b);
+  const steps = [];
+  for (const position of positions) {
+    for (const group of minStrokeGroups(byPosition.get(position), conflictMap, maxPerStroke)) {
+      steps.push({ seq: steps.length + 1, position, lanes: group, status: "pending", failureCount: 0 });
+    }
+  }
+  return steps;
+}
+
+function punchProgress(job) {
+  const totalSteps = job.steps.length;
+  const completedSteps = job.steps.filter((step) => step.status === "done").length;
+  const failedSteps = job.steps.filter((step) => step.status === "failed").length;
+  const releasedSteps = job.steps.filter((step) => step.status === "released").length;
+  return {
+    jobId: job.id,
+    tuneId: job.tuneId,
+    status: job.status,
+    totalSteps,
+    completedSteps,
+    failedSteps,
+    releasedSteps,
+    nextSeq: job.nextSeq > totalSteps ? null : job.nextSeq,
+    percent: totalSteps ? Math.round((completedSteps / totalSteps) * 100) : 100
+  };
+}
+
+function normalizeReports(body) {
+  const list = Array.isArray(body && body.reports) ? body.reports : [body];
+  if (!list.length) throw httpError(400, "回报内容不能为空");
+  return list.map((item, index) => {
+    if (!item || typeof item !== "object") throw httpError(400, `第 ${index + 1} 条回报格式错误`);
+    const seq = Number(item.seq);
+    if (!Number.isInteger(seq) || seq < 1) throw httpError(400, `第 ${index + 1} 条回报的 seq 必须是正整数`);
+    const rawResult = String(item.result === undefined ? "ok" : item.result).toLowerCase();
+    let result;
+    if (PUNCH_RESULT_OK.has(rawResult)) result = "ok";
+    else if (PUNCH_RESULT_FAILED.has(rawResult)) result = "failed";
+    else throw httpError(400, `第 ${index + 1} 条回报的 result 只能是 ok 或 failed`);
+    const report = { seq, result };
+    if (item.position !== undefined) {
+      const position = Number(item.position);
+      if (!Number.isInteger(position) || position < 0) throw httpError(400, `第 ${index + 1} 条回报的 position 非法`);
+      report.position = position;
+    }
+    if (item.lanes !== undefined) {
+      if (!Array.isArray(item.lanes) || !item.lanes.length) throw httpError(400, `第 ${index + 1} 条回报的 lanes 必须是非空数组`);
+      report.lanes = item.lanes.map((lane) => toLane(lane, "回报轨号")).sort((a, b) => a - b);
+    }
+    return report;
+  });
+}
+
+async function handleCreatePunchJob(req, res) {
+  const body = await parseBody(req);
+  required(body, ["tuneId", "holes", "pins", "maxPunchesPerStroke"]);
+  return withPunchLock(async () => {
+    const db = await readDb();
+    findTune(db, body.tuneId);
+
+    if (!Array.isArray(body.pins) || !body.pins.length) throw httpError(400, "pins 必须是非空轨号数组");
+    const pins = [...new Set(body.pins.map((pin) => toLane(pin, "冲针轨号")))].sort((a, b) => a - b);
+    const pinSet = new Set(pins);
+
+    const maxPerStroke = Number(body.maxPunchesPerStroke);
+    if (!Number.isInteger(maxPerStroke) || maxPerStroke < 1) throw httpError(400, "maxPunchesPerStroke 必须是正整数");
+
+    if (!Array.isArray(body.holes) || !body.holes.length) throw httpError(400, "holes 必须是非空孔位数组");
+    const seen = new Set();
+    const holes = [];
+    for (const raw of body.holes) {
+      const lane = toLane(raw && raw.lane, "孔位轨号");
+      const position = Number(raw && raw.position);
+      if (!Number.isInteger(position) || position < 0) throw httpError(400, "孔位行程必须是非负整数");
+      if (!pinSet.has(lane)) throw httpError(400, `轨 ${lane} 没有可用冲针`);
+      const key = `${lane}:${position}`;
+      if (seen.has(key)) continue; // 同一孔不能重复:去重
+      seen.add(key);
+      holes.push({ lane, position });
+    }
+    holes.sort((a, b) => a.position - b.position || a.lane - b.lane);
+
+    const conflictPairs = (body.conflictPairs || []).map((pair) => {
+      if (!Array.isArray(pair) || pair.length !== 2) throw httpError(400, "conflictPairs 必须是轨号对数组");
+      const a = toLane(pair[0], "冲突轨号");
+      const b = toLane(pair[1], "冲突轨号");
+      if (a === b) throw httpError(400, "冲突轨对的两个轨号不能相同");
+      return [a, b];
+    });
+
+    const steps = buildPunchPlan(holes, conflictPairs, maxPerStroke);
+    const now = new Date().toISOString();
+    const job = {
+      id: makeId("punch"),
+      tuneId: body.tuneId,
+      pins,
+      maxPunchesPerStroke: maxPerStroke,
+      conflictPairs,
+      holes,
+      totalHoles: holes.length,
+      steps,
+      status: "pending",
+      nextSeq: 1,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      cancelledAt: null
+    };
+    db.punchJobs.push(job);
+    await writeDb(db);
+    return send(res, 201, { data: { ...job, progress: punchProgress(job) } });
+  });
+}
+
+async function handlePunchReport(req, res, jobId) {
+  const body = await parseBody(req);
+  const reports = normalizeReports(body);
+  return withPunchLock(async () => {
+    const db = await readDb();
+    const job = findPunchJob(db, jobId);
+    const totalSteps = job.steps.length;
+
+    // 重复回报:所报步骤全部已执行过 → 返回原进度,不改状态
+    if (reports.every((report) => report.seq < job.nextSeq)) {
+      return send(res, 200, { data: punchProgress(job), deduplicated: true, message: "重复回报,返回当前进度" });
+    }
+
+    if (job.status === "cancelled") throw httpError(409, "任务已取消,后续步骤已释放");
+    if (job.status === "completed") throw httpError(409, "任务已完成");
+
+    // 先整体校验:必须从 nextSeq 开始连续、与计划一致;任何错误都不改状态
+    let expected = job.nextSeq;
+    let failedSeen = false;
+    for (const report of reports) {
+      if (report.seq > totalSteps) throw httpError(409, `步骤 ${report.seq} 不存在,任务共 ${totalSteps} 步`);
+      if (failedSeen) throw httpError(409, "失败步骤之后的步骤不能在同一批次回报");
+      if (report.seq < expected) throw httpError(409, `步骤 ${report.seq} 已执行,属于乱序回报`);
+      if (report.seq > expected) throw httpError(409, `缺步:期望步骤 ${expected},收到 ${report.seq}`);
+      const step = job.steps[report.seq - 1];
+      if (report.position !== undefined && report.position !== step.position) {
+        throw httpError(409, `回报与计划冲突:步骤 ${report.seq} 的行程应为 ${step.position},收到 ${report.position}`);
+      }
+      if (report.lanes !== undefined && JSON.stringify(report.lanes) !== JSON.stringify(step.lanes)) {
+        throw httpError(409, `回报与计划冲突:步骤 ${report.seq} 的轨位应为 [${step.lanes.join(",")}]`);
+      }
+      if (report.result === "failed") failedSeen = true;
+      expected += 1;
+    }
+
+    const now = new Date().toISOString();
+    for (const report of reports) {
+      const step = job.steps[report.seq - 1];
+      if (report.result === "ok") {
+        step.status = "done";
+        step.completedAt = now;
+        job.nextSeq = report.seq + 1;
+      } else {
+        step.status = "failed"; // 进度不变,失败步骤可从原进度重试
+        step.failureCount = (step.failureCount || 0) + 1;
+        step.lastFailedAt = now;
+      }
+    }
+    if (job.nextSeq > totalSteps) {
+      job.status = "completed";
+      job.completedAt = now;
+    } else {
+      job.status = "in_progress";
+    }
+    job.updatedAt = now;
+    await writeDb(db);
+    return send(res, 200, { data: punchProgress(job), applied: reports.length });
+  });
+}
+
+async function handlePunchCancel(req, res, jobId) {
+  return withPunchLock(async () => {
+    const db = await readDb();
+    const job = findPunchJob(db, jobId);
+    if (job.status === "cancelled") {
+      return send(res, 200, { data: { ...job, progress: punchProgress(job) }, message: "任务已处于取消状态" });
+    }
+    if (job.status === "completed") throw httpError(409, "任务已完成,无法取消");
+    const now = new Date().toISOString();
+    job.status = "cancelled";
+    job.cancelledAt = now;
+    job.updatedAt = now;
+    for (const step of job.steps) {
+      if (step.status !== "done") step.status = "released"; // 取消释放后续步骤
+    }
+    await writeDb(db);
+    return send(res, 200, { data: { ...job, progress: punchProgress(job) } });
+  });
 }
 
 async function handle(req, res) {
@@ -269,6 +557,47 @@ async function handle(req, res) {
     issue.note = body.note ?? issue.note;
     await writeDb(db);
     return send(res, 200, { data: issue });
+  }
+
+  if (req.method === "POST" && pathname === "/punch-jobs") {
+    return handleCreatePunchJob(req, res);
+  }
+
+  if (req.method === "GET" && pathname === "/punch-jobs") {
+    const tuneId = searchParams.get("tuneId");
+    const status = searchParams.get("status");
+    const jobs = db.punchJobs
+      .filter((item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status))
+      .map((job) => ({ ...job, progress: punchProgress(job) }));
+    return send(res, 200, { data: jobs });
+  }
+
+  const punchPlanMatch = pathname.match(/^\/punch-jobs\/([^/]+)\/plan$/);
+  if (punchPlanMatch && req.method === "GET") {
+    const job = findPunchJob(db, punchPlanMatch[1]);
+    return send(res, 200, { data: job.steps });
+  }
+
+  const punchProgressMatch = pathname.match(/^\/punch-jobs\/([^/]+)\/progress$/);
+  if (punchProgressMatch && req.method === "GET") {
+    const job = findPunchJob(db, punchProgressMatch[1]);
+    return send(res, 200, { data: punchProgress(job) });
+  }
+
+  const punchReportMatch = pathname.match(/^\/punch-jobs\/([^/]+)\/reports$/);
+  if (punchReportMatch && req.method === "POST") {
+    return handlePunchReport(req, res, punchReportMatch[1]);
+  }
+
+  const punchCancelMatch = pathname.match(/^\/punch-jobs\/([^/]+)\/cancel$/);
+  if (punchCancelMatch && req.method === "POST") {
+    return handlePunchCancel(req, res, punchCancelMatch[1]);
+  }
+
+  const punchJobMatch = pathname.match(/^\/punch-jobs\/([^/]+)$/);
+  if (punchJobMatch && req.method === "GET") {
+    const job = findPunchJob(db, punchJobMatch[1]);
+    return send(res, 200, { data: { ...job, progress: punchProgress(job) } });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
